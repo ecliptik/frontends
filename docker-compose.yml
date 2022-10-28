@@ -1,0 +1,213 @@
+version: '2.4'
+services:
+  openvpn:
+    container_name: openvpn
+    build:
+      context: ./openvpn/
+    stdin_open: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    dns:
+      - 208.67.222.222
+    volumes:
+      - './openvpn/openvpn.ovpn:/etc/openvpn/openvpn.ovpn'
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl" ,"-f", "ipinfo.io/ip" ]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 1m
+  bibliogram:
+    container_name: bibliogram
+    build:
+      context: ./bibliogram/
+    stdin_open: true
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      openvpn:
+        condition: service_healthy
+  nitter:
+    container_name: nitter
+    build:
+      context: ./nitter/
+    volumes:
+      - './nitter/nitter.conf:/src/nitter.conf:ro'
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    depends_on:
+      redis:
+        condition: service_healthy
+      openvpn:
+        condition: service_healthy
+    restart: unless-stopped
+  teddit:
+    container_name: teddit
+    build:
+      context: ./teddit/
+    environment:
+      - DOMAIN=teddit.example.com
+      - USE_HELMET=true
+      - USE_HELMET_HSTS=true
+      - TRUST_PROXY=true
+      - REDIS_HOST=localhost
+      - USE_COMPRESSION=false
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      openvpn:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget" ,"--no-verbose", "--tries=1", "--spider", "http://localhost:8080/about"]
+      interval: 1m
+      timeout: 3s
+  imgin:
+    container_name: imgin
+    build:
+      context: ./imgin/
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      openvpn:
+        condition: service_healthy
+  scribe:
+    container_name: scribe
+    build:
+      context: ./scribe/
+    environment:
+      - SCRIBE_PORT=8084
+      - SCRIBE_HOST=0.0.0.0
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      openvpn:
+        condition: service_healthy
+  invidious:
+    container_name: invidious
+    image: quay.io/invidious/invidious:latest
+    network_mode: 'service:openvpn'
+    restart: unless-stopped
+    environment:
+      # Please read the following file for a comprehensive list of all available
+      # configuration options and their associated syntax:
+      # https://github.com/iv-org/invidious/blob/master/config/config.example.yml
+      INVIDIOUS_CONFIG: |
+        db:
+          dbname: invidious
+          user: kemal
+          password: kemal
+          host: localhost
+          port: 5432
+        check_tables: true
+        domain: invidious.example.com
+        https_only: true
+        external_port: 443
+        use_quic: true
+        popular_enabled: false
+        registration_enabled: false
+        channel_threads: 4
+        feed_threads: 4
+        full_refresh: false
+        admins: ["admin"]
+        channel_refresh_interval: 15m
+        statistics_enabled: true
+    healthcheck:
+      test: wget -nv --tries=1 --spider http://127.0.0.1:3000/api/v1/comments/jNQXAC9IVRw || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 2
+    depends_on:
+      openvpn:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+  searxng:
+    container_name: searxng
+    image: searxng/searxng
+    network_mode: 'service:openvpn'
+    environment:
+      - BASE_URL=https://search.example.com
+      - INSTANCE_NAME=searxng
+      - BIND_ADDRESS=0.0.0.0:8086
+    volumes:
+      - ./searxng/settings.yml:/usr/local/searxng/searx/settings.yml
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      openvpn:
+        condition: service_healthy
+  redis:
+    container_name: redis
+    image: public.ecr.aws/docker/library/redis:6-alpine
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis:/data
+    network_mode: 'service:openvpn'
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    depends_on:
+      openvpn:
+        condition: service_healthy
+    healthcheck:
+      test: redis-cli ping
+      interval: 30s
+      timeout: 5s
+      retries: 2
+  postgres:
+    container_name: postgres
+    network_mode: 'service:openvpn'
+    image: public.ecr.aws/docker/library/postgres:14
+    restart: unless-stopped
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+      - ./invidious/config/sql:/config/sql
+      - ./invidious/docker/init-invidious-db.sh:/docker-entrypoint-initdb.d/init-invidious-db.sh
+    environment:
+      POSTGRES_DB: invidious
+      POSTGRES_USER: kemal
+      POSTGRES_PASSWORD: kemal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+  nginx:
+    container_name: nginx
+    image: 'public.ecr.aws/nginx/nginx:1.23'
+    stdin_open: true
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    ports:
+      - '80:80/tcp'
+      - '443:443/tcp'
+    volumes:
+      - './nginx/default.conf:/etc/nginx/conf.d/default.conf:ro'
+      - './nginx/shared.conf:/etc/nginx/conf.d/shared.conf:ro'
+      - '/etc/letsencrypt/live/example.com/fullchain.pem:/etc/ssl/fullchain.pem:ro'
+      - '/etc/letsencrypt/live/example.com/privkey.pem:/etc/ssl/privkey.pem:ro'
+    links:
+      - 'openvpn:bibliogram'
+      - 'openvpn:scribe'
+      - 'openvpn:imgin'
+      - 'openvpn:searxng'
+      - 'openvpn:nitter'
+      - 'openvpn:teddit'
+      - 'openvpn:invidious'
+    restart: unless-stopped
+volumes:
+  redis:
